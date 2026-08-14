@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Roblox Studio MCP Client
-Connects to Roblox Studio MCP Server untuk mengontrol Studio
+Roblox Studio MCP Client v3.0
+Connects to Roblox Studio MCP Server dengan auto port detection
 """
 
 import subprocess
@@ -17,10 +17,12 @@ class RobloxMCPClient:
         self.mcp_server_cmd = "cmd.exe"
         self.mcp_server_args = ["/d", "/s", "/c", "cd /d %LOCALAPPDATA%\\Roblox && .\\mcp.bat"]
         self.is_connected = False
-        self.mcp_port = 50051
+        self.mcp_port = None
         self.mcp_host = "localhost"
         self.max_retries = 3
         self.retry_delay = 2
+        # Scan range port
+        self.port_range = range(50051, 50100)
     
     def is_roblox_running(self):
         """Check apakah Roblox Studio running"""
@@ -36,38 +38,84 @@ class RobloxMCPClient:
             print(f"[✗] Error check Roblox: {e}")
             return False
     
-    def is_mcp_port_open(self):
-        """Check apakah MCP Server port terbuka"""
+    def is_port_open(self, port):
+        """Check apakah port tertentu terbuka"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            result = sock.connect_ex((self.mcp_host, self.mcp_port))
+            sock.settimeout(1)
+            result = sock.connect_ex((self.mcp_host, port))
             sock.close()
             return result == 0
-        except Exception as e:
-            print(f"[✗] Socket error: {e}")
+        except Exception:
             return False
     
-    def start_mcp_server(self):
-        """Coba start MCP Server"""
+    def scan_available_ports(self):
+        """Scan range port untuk cari port yang terbuka dari Roblox"""
+        print(f"[*] Scanning port {self.port_range.start}-{self.port_range.stop-1} untuk Roblox MCP Server...")
+        
+        available_ports = []
+        for port in self.port_range:
+            if self.is_port_open(port):
+                available_ports.append(port)
+                print(f"    [✓] Port {port} terbuka")
+        
+        return available_ports
+    
+    def get_roblox_process_ports(self):
+        """Get semua port yang digunakan oleh Roblox process"""
         try:
-            print("[*] Mencoba start MCP Server...")
-            # Jalankan mcp.bat di background
-            subprocess.Popen(
-                self.mcp_server_args,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            # Get PID dari RobloxStudioBeta
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq RobloxStudioBeta.exe', '/FO', 'CSV'],
+                capture_output=True,
+                text=True,
+                timeout=5
             )
-            print("[*] MCP Server process dimulai, tunggu 3 detik...")
-            time.sleep(3)
-            return True
+            
+            if 'RobloxStudioBeta.exe' not in result.stdout:
+                return []
+            
+            # Parse output untuk dapat PID
+            lines = result.stdout.strip().split('\n')
+            if len(lines) < 2:
+                return []
+            
+            # Format: "RobloxStudioBeta.exe","PID"
+            pid_line = lines[1].replace('"', '').split(',')
+            if len(pid_line) < 2:
+                return []
+            
+            pid = pid_line[1].strip()
+            print(f"[*] Roblox Studio PID: {pid}")
+            
+            # Get semua port yang digunakan oleh PID ini
+            result = subprocess.run(
+                f'netstat -ano | findstr "{pid}"',
+                capture_output=True,
+                text=True,
+                shell=True,
+                timeout=5
+            )
+            
+            ports = []
+            for line in result.stdout.split('\n'):
+                if 'LISTENING' in line and '127.0.0.1' in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        try:
+                            port = int(parts[1].split(':')[-1])
+                            ports.append(port)
+                        except:
+                            pass
+            
+            return sorted(list(set(ports)))
+        
         except Exception as e:
-            print(f"[✗] Error start MCP Server: {e}")
-            return False
+            print(f"[✗] Error get process ports: {e}")
+            return []
     
     def connect(self):
-        """Sambungkan ke Roblox Studio MCP Server dengan retry logic"""
+        """Sambungkan ke Roblox Studio MCP Server dengan auto port detection"""
         print("[*] Memulai koneksi ke Roblox Studio...")
         
         # Step 1: Check Roblox Studio running
@@ -78,61 +126,87 @@ class RobloxMCPClient:
         
         print("[✓] Roblox Studio terdeteksi RUNNING")
         
-        # Step 2: Try connect ke MCP Server dengan retry
-        for attempt in range(1, self.max_retries + 1):
-            print(f"\n[*] Attempt {attempt}/{self.max_retries} - Cek MCP Server port {self.mcp_port}...")
-            
-            if self.is_mcp_port_open():
-                print("[✓] MCP Server PORT TERBUKA - Koneksi BERHASIL!")
-                self.is_connected = True
-                return True
-            
-            if attempt < self.max_retries:
-                print(f"[*] Port belum terbuka, tunggu {self.retry_delay} detik sebelum retry...")
-                time.sleep(self.retry_delay)
+        # Step 2: Get ports yang digunakan Roblox
+        print("\n[*] Detecting Roblox port usage...")
+        roblox_ports = self.get_roblox_process_ports()
         
-        # Step 3: Jika semua attempt gagal, tawarkan untuk start MCP Server
-        print("\n[✗] MCP Server tidak merespons di semua attempt")
+        if roblox_ports:
+            print(f"[✓] Ports yang digunakan Roblox: {roblox_ports}")
+        else:
+            print("[*] Tidak bisa detect port dari process, scanning range port...")
+        
+        # Step 3: Combine ports untuk dicoba
+        ports_to_try = []
+        
+        # Prioritas 1: Port standar
+        if self.is_port_open(50051):
+            ports_to_try.append(50051)
+        
+        # Prioritas 2: Port yang terdeteksi dari Roblox
+        ports_to_try.extend(roblox_ports)
+        
+        # Prioritas 3: Scan semua port dalam range
+        scanned_ports = self.scan_available_ports()
+        for port in scanned_ports:
+            if port not in ports_to_try:
+                ports_to_try.append(port)
+        
+        if not ports_to_try:
+            print("\n[✗] Tidak ada port yang terbuka dari Roblox!")
+            print("[!] MCP Server mungkin belum di-enable atau tidak berjalan")
+            return False
+        
+        print(f"\n[*] Mencoba connect ke {len(ports_to_try)} port(s): {ports_to_try}")
+        
+        # Step 4: Try connect ke setiap port
+        for port in ports_to_try:
+            for attempt in range(1, self.max_retries + 1):
+                print(f"\n[*] Attempt {attempt}/{self.max_retries} - Port {port}...")
+                
+                if self.is_port_open(port):
+                    print(f"[✓] PORT {port} TERBUKA - Koneksi BERHASIL!")
+                    self.mcp_port = port
+                    self.is_connected = True
+                    return True
+                
+                if attempt < self.max_retries:
+                    print(f"    Tunggu {self.retry_delay} detik...")
+                    time.sleep(self.retry_delay)
+        
+        print("\n[✗] Tidak bisa connect ke semua port yang dicoba")
         print("[!] Pastikan MCP Server sudah di-enable di Roblox Studio!")
         print("\nLangkah untuk enable MCP Server:")
         print("  1. Buka Roblox Studio")
         print("  2. Menu → Assistant Settings")
-        print("  3. Toggle ON: 'Enable Studio as MCP server'")
-        print("  4. Tunggu hingga muncul '2 clients connected'")
-        print("  5. Coba connect lagi\n")
+        print("  3. Klik tab 'MCP Servers'")
+        print("  4. Toggle ON: 'Enable Studio as MCP server'")
+        print("  5. Tunggu hingga muncul '2 clients connected'")
+        print("  6. Coba connect lagi\n")
         
         return False
     
     def check_mcp_server(self):
-        """Check status MCP Server dengan detail"""
+        """Check status MCP Server"""
         print("[*] Checking MCP Server status...")
         
-        # Method 1: Check port
-        if self.is_mcp_port_open():
-            print(f"[✓] MCP Server AKTIF di {self.mcp_host}:{self.mcp_port}")
-            self.is_connected = True
-            return True
-        
-        # Method 2: Check via netstat
-        try:
-            result = subprocess.run(
-                f'netstat -ano | findstr ":{self.mcp_port}"',
-                capture_output=True,
-                text=True,
-                shell=True,
-                timeout=5
-            )
-            
-            if result.returncode == 0 and result.stdout:
-                print(f"[✓] MCP Server process terdeteksi di port {self.mcp_port}")
-                self.is_connected = True
+        if self.mcp_port:
+            if self.is_port_open(self.mcp_port):
+                print(f"[✓] MCP Server AKTIF di {self.mcp_host}:{self.mcp_port}")
                 return True
-        except Exception as e:
-            print(f"[✗] Netstat check error: {e}")
+            else:
+                print(f"[✗] MCP Server port {self.mcp_port} tidak responding")
+                return False
         
-        print("[✗] MCP Server tidak merespons")
-        print("[!] Silakan enable MCP Server di Assistant Settings → Roblox Studio")
-        return False
+        # Jika belum tahu port, scan lagi
+        print("[*] Port belum diketahui, scan range port...")
+        available_ports = self.scan_available_ports()
+        
+        if available_ports:
+            print(f"[✓] Port yang tersedia: {available_ports}")
+            return True
+        else:
+            print("[✗] Tidak ada port yang terbuka")
+            return False
     
     def send_command(self, command: str, args: dict = None):
         """Kirim command ke Roblox Studio"""
@@ -143,6 +217,7 @@ class RobloxMCPClient:
         
         try:
             print(f"[*] Mengirim command: {command}")
+            print(f"[*] Target port: {self.mcp_port}")
             payload = {
                 "jsonrpc": "2.0",
                 "method": command,
@@ -180,6 +255,7 @@ class RobloxMCPClient:
     def disconnect(self):
         """Putus koneksi dari Roblox Studio"""
         self.is_connected = False
+        self.mcp_port = None
         print("[✓] Disconnected dari Roblox Studio")
     
     def show_connection_status(self):
@@ -187,16 +263,30 @@ class RobloxMCPClient:
         print("\n" + "="*60)
         print("CONNECTION STATUS")
         print("="*60)
-        print(f"Roblox Studio: {'✓ RUNNING' if self.is_roblox_running() else '✗ NOT RUNNING'}")
-        print(f"MCP Server: {'✓ CONNECTED' if self.is_mcp_port_open() else '✗ NOT CONNECTED'}")
+        roblox_running = self.is_roblox_running()
+        print(f"Roblox Studio: {'✓ RUNNING' if roblox_running else '✗ NOT RUNNING'}")
+        
+        if self.mcp_port:
+            mcp_active = self.is_port_open(self.mcp_port)
+            print(f"MCP Server: {'✓ ACTIVE' if mcp_active else '✗ INACTIVE'} (Port {self.mcp_port})")
+        else:
+            print(f"MCP Server: ✗ PORT NOT DETECTED")
+        
         print(f"Client Status: {'✓ CONNECTED' if self.is_connected else '✗ NOT CONNECTED'}")
+        
+        if roblox_running and not self.mcp_port:
+            print("\n[*] Scanning untuk detect MCP Server port...")
+            available_ports = self.scan_available_ports()
+            if available_ports:
+                print(f"[✓] Available ports: {available_ports}")
+        
         print("="*60 + "\n")
 
 
 def main():
     print("=" * 60)
-    print("ROBLOX STUDIO MCP CLIENT v2.0")
-    print("Updated with better error handling & auto-retry")
+    print("ROBLOX STUDIO MCP CLIENT v3.0")
+    print("Auto Port Detection & Advanced Scanning")
     print("=" * 60)
     print()
     
@@ -208,16 +298,17 @@ def main():
         print("1. Connect ke Roblox Studio")
         print("2. Check MCP Server Status")
         print("3. Show Connection Status")
-        print("4. List Open Places")
-        print("5. Save Place")
-        print("6. Play")
-        print("7. Stop")
-        print("8. Run Lua Script")
-        print("9. Disconnect")
+        print("4. Scan Available Ports")
+        print("5. List Open Places")
+        print("6. Save Place")
+        print("7. Play")
+        print("8. Stop")
+        print("9. Run Lua Script")
+        print("10. Disconnect")
         print("0. Exit")
         print("-" * 60)
         
-        choice = input("Pilih menu (0-9): ").strip()
+        choice = input("Pilih menu (0-10): ").strip()
         
         if choice == "1":
             client.connect()
@@ -229,19 +320,26 @@ def main():
             client.show_connection_status()
         
         elif choice == "4":
-            client.list_open_places()
+            ports = client.scan_available_ports()
+            if ports:
+                print(f"\n[✓] Available ports: {ports}")
+            else:
+                print("\n[✗] Tidak ada port yang terbuka")
         
         elif choice == "5":
+            client.list_open_places()
+        
+        elif choice == "6":
             place_id = input("Masukkan Place ID (atau kosongkan): ").strip() or None
             client.save_place(place_id)
         
-        elif choice == "6":
+        elif choice == "7":
             client.play()
         
-        elif choice == "7":
+        elif choice == "8":
             client.stop()
         
-        elif choice == "8":
+        elif choice == "9":
             print("Masukkan Lua script (ketik 'END' di baris terakhir):")
             lines = []
             while True:
@@ -255,7 +353,7 @@ def main():
             else:
                 print("[✗] Script kosong!")
         
-        elif choice == "9":
+        elif choice == "10":
             client.disconnect()
         
         elif choice == "0":
@@ -263,7 +361,7 @@ def main():
             break
         
         else:
-            print("[✗] Input tidak valid, silakan pilih 0-9")
+            print("[✗] Input tidak valid, silakan pilih 0-10")
 
 
 if __name__ == "__main__":
